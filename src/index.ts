@@ -17,8 +17,21 @@ export interface AtlasBurnSDKOptions {
   gateUrl?: string;
   batchSize?: number;
   maxQueueSize?: number;
-  metadata?: AtlasBurnMetadata; 
-  debug?: boolean; 
+  metadata?: AtlasBurnMetadata;
+  debug?: boolean;
+  /** Operator hook for capture/gate anomalies — e.g. a provider usage-format change
+   *  that would otherwise silently record $0, or a dropped flush/gate call. Fired
+   *  out-of-band; wrapped so it never throws into the host (Law 1). Wire it to your
+   *  monitoring to break the silence of Law 4. (SEC-002 #3) */
+  onError?: (info: AtlasBurnDiagnostic) => void;
+}
+
+/** A capture/gate anomaly surfaced via `options.onError` (and a `debug` log). */
+export interface AtlasBurnDiagnostic {
+  stage: 'capture_json_failed' | 'capture_stream_failed' | 'zero_usage' | 'zero_usage_stream' | 'gate_error' | 'flush_failed';
+  url?: string;
+  model?: string;
+  error?: unknown;
 }
 
 export interface AtlasBurnMetadata {
@@ -28,7 +41,7 @@ export interface AtlasBurnMetadata {
   sdkVersion?: string;
 }
 
-const SDK_VERSION = "1.7.1";
+const SDK_VERSION = "1.9.2";
 
 /**
  * I1 — hosts auto-detected by the fetch patch. `url.includes(p)` match, so these
@@ -54,6 +67,61 @@ export const AI_PATTERNS: string[] = [
   "api.x.ai",
   "bedrock-runtime",        // AWS Bedrock (token counts via response headers; best-effort)
 ];
+
+/**
+ * The real fetch, captured at module load — BEFORE initAtlasBurnAuto patches
+ * globalThis.fetch. The SDK uses this for all of its OWN HTTP (gate + ingest) so
+ * those calls never re-enter the patched fetch. This is what lets us drop the old
+ * shared `isInternalCall` recursion flag, whose single-boolean design let concurrent
+ * AI calls skip the gate + cost capture during the gate's await window (SEC-002 #1).
+ */
+const ORIGINAL_FETCH: typeof fetch | undefined =
+  typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+    ? globalThis.fetch.bind(globalThis)
+    : undefined;
+
+/**
+ * Response returned when the gate reports the guardrail is suspended (gate.blocked).
+ *
+ * Returns a PROVIDER-NATIVE error envelope with HTTP 429, not a one-shape-fits-all
+ * 200. Two problems that fixes (SEC-002 #2):
+ *   - The old OpenAI-shaped `{choices:[...]}` body threw in Anthropic/Gemini/stream
+ *     clients that expect a different shape.
+ *   - The old HTTP 200 made an agent loop read "blocked" as a NORMAL answer and keep
+ *     going. A 429 makes the provider's own SDK raise its rate-limit error, which
+ *     agent frameworks handle by backing off / stopping — and for stream:true the
+ *     SDK checks status before reading the stream, so no SSE body is needed.
+ *
+ * The `x-atlasburn-blocked` header + `_atlasburn` body field positively identify a
+ * guardrail block (vs. a real provider 429). Exported for tests.
+ */
+export function buildBlockedResponse(url: string, gate: { message?: string; reason?: string }): Response {
+  const message = gate.message || "Request blocked by AtlasBurn safety guardrails (budget / runaway protection).";
+  const reason = gate.reason || "guardrail_suspended";
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Retry-After': '60',
+    'x-atlasburn-blocked': '1',
+    'x-atlasburn-reason': reason,
+  };
+  const marker = { blocked: true, reason };
+
+  let body: unknown;
+  if (url.includes('api.anthropic.com')) {
+    body = { type: 'error', error: { type: 'rate_limit_error', message }, _atlasburn: marker };
+  } else if (url.includes('generativelanguage.googleapis.com') || url.includes('vertexai')) {
+    body = { error: { code: 429, message, status: 'RESOURCE_EXHAUSTED' }, _atlasburn: marker };
+  } else if (url.includes('cohere')) {
+    body = { message, _atlasburn: marker };
+  } else if (url.includes('bedrock-runtime')) {
+    headers['x-amzn-errortype'] = 'ThrottlingException';
+    body = { message, _atlasburn: marker };
+  } else {
+    // OpenAI + OpenAI-compatible (Azure, OpenRouter, Groq, Together, DeepSeek, xAI, Mistral).
+    body = { error: { message, type: 'rate_limit_exceeded', code: 'atlasburn_guardrail', param: null }, _atlasburn: marker };
+  }
+  return new Response(JSON.stringify(body), { status: 429, headers });
+}
 
 /**
  * Rough, dependency-free token estimate (~4 chars/token). Used ONLY as a
@@ -136,7 +204,8 @@ function generateForensicId(): string {
       return globalThis.crypto.randomUUID();
     }
   } catch (e) { }
-  return `abn-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+  // `evt_` prefix (NOT `abn_`) so event IDs are visually unambiguous next to API keys.
+  return `evt_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
 }
 
 function resolveIngestUrl(options: AtlasBurnSDKOptions): string {
@@ -186,13 +255,25 @@ class AtlasBurnIngestor {
     }
   }
 
+  /** Report a capture/gate anomaly out-of-band: a `debug` log + the operator
+   *  `onError` callback. Never throws into the host (Law 1), never blocks (Law 2) —
+   *  it just breaks the silence so a provider format change isn't an invisible $0. */
+  public diag(info: AtlasBurnDiagnostic): void {
+    if (this.options.debug) {
+      try { console.warn(`[AtlasBurn SDK] ${info.stage}`, info.model || '', info.url || '', info.error ?? ''); } catch { /* noop */ }
+    }
+    if (typeof this.options.onError === 'function') {
+      try { this.options.onError(info); } catch { /* a bad callback must never crash the host */ }
+    }
+  }
+
   public async checkGate(featureId: string): Promise<{ blocked: boolean; status: string; message?: string; reason?: string }> {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (this.options.apiKey) {
         headers['Authorization'] = `Bearer ${this.options.apiKey.trim()}`;
       }
-      const response = await fetch(this.resolvedGateUrl, {
+      const response = await (ORIGINAL_FETCH || fetch)(this.resolvedGateUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify({ projectId: this.options.projectId || 'default', featureId }),
@@ -201,6 +282,7 @@ class AtlasBurnIngestor {
       if (!response.ok) return { blocked: false, status: 'active' };
       return await response.json();
     } catch (e) {
+      this.diag({ stage: 'gate_error', url: this.resolvedGateUrl, error: e });
       return { blocked: false, status: 'active' };
     }
   }
@@ -241,8 +323,9 @@ class AtlasBurnIngestor {
         try {
           await this.sendWithRetry(batch, 0);
         } catch (err) {
-          // Law 4 — fail silently. Drop on persistent failure (do NOT requeue: would loop).
-          if (this.options.debug) console.warn(`[AtlasBurn SDK] Flush batch failed (dropped).`, err);
+          // Law 4 — never throw into the host. Drop on persistent failure (do NOT
+          // requeue: would loop), but surface it out-of-band so it isn't invisible.
+          this.diag({ stage: 'flush_failed', error: err });
         }
       }
     } finally {
@@ -254,7 +337,7 @@ class AtlasBurnIngestor {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (this.options.authToken) headers['Authorization'] = `Bearer ${this.options.authToken}`;
-      const response = await fetch(this.resolvedIngestUrl, {
+      const response = await (ORIGINAL_FETCH || fetch)(this.resolvedIngestUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -332,31 +415,26 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
   _atlasBurnPatched = true;
 
   let currentFetch = globalThis.fetch;
-  let isInternalCall = false;
-
   const wrappedFetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
-    if (isInternalCall) return currentFetch(...args);
-
     const input = args[0];
     const url = (input instanceof Request ? input.url : input?.toString()) || "";
     const isAIUrl = AI_PATTERNS.some(p => url.includes(p));
 
     if (!isAIUrl) return currentFetch(...args);
 
-    // Gate check
+    // Gate check. The ingestor's own HTTP uses ORIGINAL_FETCH, so checkGate never
+    // re-enters this wrapper — no recursion flag is needed, and concurrent AI calls
+    // are each gated + captured independently (fixes the shared-flag skip, SEC-002 #1).
     if (isAIUrl) {
       try {
-        isInternalCall = true;
         const gate = await ingestor.checkGate("auto-detect");
-        isInternalCall = false;
         if (gate.blocked) {
-          return new Response(JSON.stringify({
-            choices: [{ message: { content: gate.message || "Request blocked by AtlasBurn safety guardrails." } }],
-            _atlasburn: { blocked: true, reason: gate.reason }
-          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+          // Provider-native 429 (SEC-002 #2) — not a one-shape 200 that breaks
+          // non-OpenAI parsers and lets agent loops treat a block as a real answer.
+          return buildBlockedResponse(url, gate);
         }
       } catch (e) {
-        isInternalCall = false;
+        // Gate check failed — fail open (proceed with the call), per Law 2.
       }
     }
 
@@ -398,8 +476,12 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
             latency,
             usage: { prompt_tokens: p, completion_tokens: c }
           });
+        } else {
+          // 200 JSON from an AI endpoint but no usage extracted — the classic signal
+          // of a provider changing its usage format. Surface it instead of $0. (SEC-002 #3)
+          ingestor.diag({ stage: 'zero_usage', url, model: data?.model || data?.modelVersion });
         }
-      } catch (e) { }
+      } catch (e) { ingestor.diag({ stage: 'capture_json_failed', url, error: e }); }
     } else if (contentType.includes("text/event-stream")) {
       const reader = response.clone().body?.getReader();
       if (reader) {
@@ -462,8 +544,12 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
                   completion_tokens: estimateTokens(completionText),
                 },
               });
+            } else {
+              // Stream ended with no usage AND no text to estimate from — a format
+              // change or a provider we can't read. Surface instead of $0. (SEC-002 #3)
+              ingestor.diag({ stage: 'zero_usage_stream', url, model: finalModel });
             }
-          } catch (e) { }
+          } catch (e) { ingestor.diag({ stage: 'capture_stream_failed', url, error: e }); }
         })();
       }
     }
@@ -482,6 +568,9 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
 export async function verifyAtlasBurn(options: AtlasBurnSDKOptions) {
   const ingestor = getIngestor(options);
   if (!ingestor) return;
-  ingestor.enqueue({ model: "verification-pulse", featureId: "sdk-verification", usage: { prompt_tokens: 1, completion_tokens: 0 } });
+  // apiCallType:'verification' → the ingest route bills a nominal $0.00001 and
+  // stores it as a `verification` event, so it's clearly distinguishable from
+  // production telemetry in the dashboard (used by `abn test`).
+  ingestor.enqueue({ model: "verification-pulse", featureId: "sdk-verification", apiCallType: "verification", usage: { prompt_tokens: 1, completion_tokens: 0 } });
   await ingestor.flush();
 }
