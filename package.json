@@ -1,10 +1,13 @@
 {
   "name": "@atlasburn/sdk",
-  "version": "1.7.1",
+  "version": "1.9.2",
   "description": "Real-time AI cost monitoring and control SDK. Auto-captures token usage and spend from OpenAI, Anthropic, Gemini, and 10 more LLM providers, with runtime guardrails to stop runaway AI agents before they overspend.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "abn": "dist/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -20,6 +23,10 @@
     "build": "tsc",
     "prepublishOnly": "npm run build"
   },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "5.7.3"
+  },
   "keywords": [
     "ai",
     "llm",
@@ -33,7 +40,14 @@
     "anthropic",
     "gemini",
     "cost-tracking",
+    "cost-monitoring",
+    "llm-cost-tracking",
+    "ai-budget",
+    "llm-budget",
     "ai-guardrails",
+    "llm-guardrails",
+    "rate-limit",
+    "llmops",
     "ai-finops",
     "runaway-agent",
     "budget",

@@ -13,13 +13,17 @@ AtlasBurn is a runtime cost-protection layer for AI systems. This SDK auto-captu
 
 ```bash
 npm i @atlasburn/sdk
+npx abn init        # optional: detects your framework and wires everything up for you
 ```
 
 ```typescript
 import { initAtlasBurnAuto } from "@atlasburn/sdk";
 
-// Call once at the top of your app. That's it.
-initAtlasBurnAuto({ apiKey: process.env.ATLASBURN_KEY });
+// Call once at the top of your app, before importing any AI SDK. That's it.
+// The if-guard narrows ATLASBURN_KEY to a string, so this type-checks under strict mode.
+if (process.env.ATLASBURN_KEY) {
+  initAtlasBurnAuto({ apiKey: process.env.ATLASBURN_KEY });
+}
 
 // Every AI call — OpenAI, Anthropic, Gemini, and 10 more — is now
 // captured, costed, and (optionally) guarded. No wrappers, no middleware.
@@ -91,6 +95,7 @@ import {
   extractTokenUsage,   // pure helper: parse tokens from any provider response
   injectStreamUsage,   // pure helper: add stream_options.include_usage
   estimateTokens,      // dependency-free fallback token estimate
+  buildBlockedResponse,// the provider-native 429 returned when a guardrail blocks a call
 } from "@atlasburn/sdk";
 ```
 
@@ -98,12 +103,15 @@ import {
 Patches `globalThis.fetch`, runs a pre-call gate check, and captures usage from every recognized provider.
 
 ```typescript
-initAtlasBurnAuto({
-  apiKey: process.env.ATLASBURN_KEY!,   // required
-  metadata: { featureId: "checkout-summarizer" }, // optional attribution
-  batchSize: 5,        // flush after N events (default 5)
-  debug: false,        // log interception activity
-});
+if (process.env.ATLASBURN_KEY) {
+  initAtlasBurnAuto({
+    apiKey: process.env.ATLASBURN_KEY,               // required
+    metadata: { featureId: "checkout-summarizer" },  // optional attribution
+    batchSize: 5,        // flush after N events (default 5)
+    debug: false,        // log interception activity + diagnostics
+    onError: (d) => console.warn("[atlasburn]", d.stage, d.url ?? ""), // optional, see Diagnostics
+  });
+}
 ```
 
 ### `getIngestor(options)` — manual instrumentation
@@ -119,7 +127,55 @@ ingestor?.enqueue({
 ```
 
 ### `verifyAtlasBurn(options)`
-Sends a verification pulse without making a real LLM call — perfect for a CI/CD connectivity check.
+Sends a verification pulse without making a real LLM call — perfect for a CI/CD connectivity check. The pulse is tagged `apiCallType: "verification"`, so it never shows up as production spend.
+
+---
+
+## CLI — `abn`
+
+The package ships a small CLI (`npx abn <command>`):
+
+| Command | What it does |
+|---|---|
+| `abn init` | Detects your framework, asks for your ingest key (hidden input, `abn_` prefix-validated), shows a diff and asks before writing. Next.js → `instrumentation.ts`; Node → `atlasburn.ts` plus one import line in your entry file. Both go in `src/` when your project has one (inside a typical tsconfig `include`), otherwise the project root. |
+| `abn test` | Verifies your key + connectivity and sends one verification event. |
+| `abn status` | Shows the current guardrail state (active / throttled / suspended). |
+| `abn doctor` | Environment diagnostics (Node version, `fetch`, project detection). |
+
+Flags: `--dry-run` (preview, write nothing) and `--yes` (no prompts, for CI).
+
+---
+
+## When a guardrail blocks a call
+
+If your project's guardrail is **suspended** (for example a hard-stop budget breach), the SDK short-circuits the AI call **before it reaches the provider**. No tokens are spent. Instead it returns an **HTTP 429 in that provider's own error format**:
+
+| Provider | Error body |
+|---|---|
+| OpenAI and OpenAI-compatible (Azure, OpenRouter, Groq, Together, DeepSeek, xAI, Mistral) | `{ "error": { "type": "rate_limit_exceeded", "code": "atlasburn_guardrail", … } }` |
+| Anthropic | `{ "type": "error", "error": { "type": "rate_limit_error", … } }` |
+| Google Gemini / Vertex | `{ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED", … } }` |
+| Cohere / Bedrock | `{ "message": … }` (Bedrock also sets `x-amzn-errortype: ThrottlingException`) |
+
+Because it's a real 429, the official provider SDKs raise their normal rate-limit error. Well-behaved agents back off or stop instead of treating the block as an answer and looping, and streaming calls are covered too, since SDKs check the status before reading the stream. To tell an AtlasBurn block apart from a genuine provider 429, check the **`x-atlasburn-blocked: 1`** header (also sent: `x-atlasburn-reason`, `Retry-After: 60`) or the `_atlasburn.blocked` field in the body.
+
+Gate *errors* still fail open: if AtlasBurn can't be reached, your call proceeds normally.
+
+---
+
+## Diagnostics — `onError`
+
+The SDK never throws into your app (Law 1), but a silent failure can hide bad cost data. For example, a provider changing its usage format would otherwise just record $0. Pass `onError` to see these out of band. It's called with `{ stage, url?, model?, error? }`, and a throwing callback can never crash your app.
+
+| `stage` | Meaning |
+|---|---|
+| `zero_usage` | An AI call returned 200 JSON but no token usage could be read (likely a provider format change). |
+| `zero_usage_stream` | A stream ended with no usage and no text to estimate from. |
+| `capture_json_failed` / `capture_stream_failed` | Parsing the response for usage threw. |
+| `gate_error` | The pre-call gate check failed (the call proceeded, fail-open). |
+| `flush_failed` | A telemetry batch couldn't be delivered after retries and was dropped. |
+
+With `debug: true` the same events are also logged to the console.
 
 ---
 
@@ -135,7 +191,7 @@ your app ──► @atlasburn/sdk (patched fetch)
                                     └─► Cloudflare edge: 403 / throttle
 ```
 
-The SDK is fail-open and soft (never blocks your app); the [edge proxy](https://docs.atlasburn.com/docs/edge-proxy) is the hard-enforcement path.
+The SDK fails open on errors. When a guardrail is suspended it stops the call before it's sent and returns a provider-native 429 (see [above](#when-a-guardrail-blocks-a-call)). The [edge proxy](https://docs.atlasburn.com/docs/edge-proxy) is the language-agnostic hard-enforcement path.
 
 ---
 

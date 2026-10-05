@@ -6,11 +6,18 @@
 import { initAtlasBurnAuto } from "@atlasburn/sdk";
 
 // 1. Initialize once at the top of your app (patches globalThis.fetch).
-initAtlasBurnAuto({
-  apiKey: process.env.ATLASBURN_KEY!,
-  metadata: { featureId: "demo" },
-  debug: true,
-});
+//    The if-guard narrows ATLASBURN_KEY to a string, so this type-checks under strict mode.
+if (process.env.ATLASBURN_KEY) {
+  initAtlasBurnAuto({
+    apiKey: process.env.ATLASBURN_KEY,
+    metadata: { featureId: "demo" },
+    debug: true,
+    // Surface silent capture problems (e.g. a provider usage-format change → $0).
+    onError: (d) => console.warn(`[atlasburn] ${d.stage}`, d.url ?? ""),
+  });
+} else {
+  console.warn("[atlasburn] ATLASBURN_KEY not set — telemetry disabled.");
+}
 
 // 2. Make any AI call as you normally would — it's captured automatically.
 async function main() {
@@ -28,6 +35,13 @@ async function main() {
       stream: false,
     }),
   });
+
+  // 3. If a guardrail suspended this project, the call never reached OpenAI:
+  //    you get a provider-native 429 tagged with x-atlasburn-blocked.
+  if (res.headers.get("x-atlasburn-blocked") === "1") {
+    console.warn("Blocked by AtlasBurn guardrail:", res.headers.get("x-atlasburn-reason"));
+    return;
+  }
 
   const data = await res.json();
   console.log(data.choices?.[0]?.message?.content);

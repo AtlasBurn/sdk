@@ -17,6 +17,18 @@ export interface AtlasBurnSDKOptions {
     maxQueueSize?: number;
     metadata?: AtlasBurnMetadata;
     debug?: boolean;
+    /** Operator hook for capture/gate anomalies — e.g. a provider usage-format change
+     *  that would otherwise silently record $0, or a dropped flush/gate call. Fired
+     *  out-of-band; wrapped so it never throws into the host (Law 1). Wire it to your
+     *  monitoring to break the silence of Law 4. (SEC-002 #3) */
+    onError?: (info: AtlasBurnDiagnostic) => void;
+}
+/** A capture/gate anomaly surfaced via `options.onError` (and a `debug` log). */
+export interface AtlasBurnDiagnostic {
+    stage: 'capture_json_failed' | 'capture_stream_failed' | 'zero_usage' | 'zero_usage_stream' | 'gate_error' | 'flush_failed';
+    url?: string;
+    model?: string;
+    error?: unknown;
 }
 export interface AtlasBurnMetadata {
     featureId?: string;
@@ -33,6 +45,25 @@ export interface AtlasBurnMetadata {
  * proxied (deployment-scoped URLs / OAuth+project paths / SigV4 signing).
  */
 export declare const AI_PATTERNS: string[];
+/**
+ * Response returned when the gate reports the guardrail is suspended (gate.blocked).
+ *
+ * Returns a PROVIDER-NATIVE error envelope with HTTP 429, not a one-shape-fits-all
+ * 200. Two problems that fixes (SEC-002 #2):
+ *   - The old OpenAI-shaped `{choices:[...]}` body threw in Anthropic/Gemini/stream
+ *     clients that expect a different shape.
+ *   - The old HTTP 200 made an agent loop read "blocked" as a NORMAL answer and keep
+ *     going. A 429 makes the provider's own SDK raise its rate-limit error, which
+ *     agent frameworks handle by backing off / stopping — and for stream:true the
+ *     SDK checks status before reading the stream, so no SSE body is needed.
+ *
+ * The `x-atlasburn-blocked` header + `_atlasburn` body field positively identify a
+ * guardrail block (vs. a real provider 429). Exported for tests.
+ */
+export declare function buildBlockedResponse(url: string, gate: {
+    message?: string;
+    reason?: string;
+}): Response;
 /**
  * Rough, dependency-free token estimate (~4 chars/token). Used ONLY as a
  * fallback when a provider streams a response WITHOUT usage data (e.g. OpenAI
@@ -78,6 +109,10 @@ declare class AtlasBurnIngestor {
     private resolvedGateUrl;
     private flushInterval;
     constructor(options: AtlasBurnSDKOptions);
+    /** Report a capture/gate anomaly out-of-band: a `debug` log + the operator
+     *  `onError` callback. Never throws into the host (Law 1), never blocks (Law 2) —
+     *  it just breaks the silence so a provider format change isn't an invisible $0. */
+    diag(info: AtlasBurnDiagnostic): void;
     checkGate(featureId: string): Promise<{
         blocked: boolean;
         status: string;
