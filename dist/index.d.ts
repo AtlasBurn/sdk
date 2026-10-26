@@ -1,5 +1,5 @@
 /**
- * AtlasBurn Forensic SDK - Institutional v1.5.0 (Universal Support)
+ * AtlasBurn Forensic SDK - v1.9.3 (Universal Support)
  *
  * THE 4 LAWS OF SDK SAFETY:
  * 1. Never crash host app
@@ -17,6 +17,17 @@ export interface AtlasBurnSDKOptions {
     maxQueueSize?: number;
     metadata?: AtlasBurnMetadata;
     debug?: boolean;
+    /** How long one guardrail gate check may take before failing open. Default 2500ms. */
+    gateTimeoutMs?: number;
+    /** How long a gate decision is reused per feature before re-checking. Default 10000ms;
+     *  0 checks before every call. Stale decisions (up to 60s) are served while a
+     *  background refresh runs, so most AI calls never wait on the gate. */
+    gateCacheMs?: number;
+    /** While a feature is throttled, minimum gap between its AI calls. Default 2000ms. */
+    throttleSpacingMs?: number;
+    /** While throttled, the longest a call may wait for its slot; deeper queues get a
+     *  blocked response instead of stalling. Default 10000ms. */
+    throttleMaxWaitMs?: number;
     /** Operator hook for capture/gate anomalies — e.g. a provider usage-format change
      *  that would otherwise silently record $0, or a dropped flush/gate call. Fired
      *  out-of-band; wrapped so it never throws into the host (Law 1). Wire it to your
@@ -99,6 +110,13 @@ export declare function extractTokenUsage(obj: any): {
     prompt: number;
     completion: number;
 };
+type GateDecision = {
+    blocked: boolean;
+    status: string;
+    message?: string;
+    reason?: string;
+    failed?: boolean;
+};
 declare class AtlasBurnIngestor {
     private queue;
     private options;
@@ -108,17 +126,36 @@ declare class AtlasBurnIngestor {
     private resolvedIngestUrl;
     private resolvedGateUrl;
     private flushInterval;
+    private gateCache;
+    private gateInflight;
+    private throttleNext;
     constructor(options: AtlasBurnSDKOptions);
     /** Report a capture/gate anomaly out-of-band: a `debug` log + the operator
      *  `onError` callback. Never throws into the host (Law 1), never blocks (Law 2) —
      *  it just breaks the silence so a provider format change isn't an invisible $0. */
     diag(info: AtlasBurnDiagnostic): void;
-    checkGate(featureId: string): Promise<{
-        blocked: boolean;
-        status: string;
-        message?: string;
-        reason?: string;
-    }>;
+    checkGate(featureId: string): Promise<GateDecision>;
+    /**
+     * Guardrail decision for a feature, without paying a gate round-trip on every AI
+     * call. Fresh (< gateCacheMs) → reuse. Stale (< 60s) → reuse and refresh in the
+     * background. Missing/too old → wait for a check. Concurrent callers share one
+     * in-flight check. A failed check never overwrites a known decision (so a known
+     * block isn't lifted by one network blip); with no known decision it fails open.
+     */
+    gateDecision(featureId: string): Promise<GateDecision>;
+    private refreshGate;
+    /** Forget cached gate decisions (tests, or after changing guardrails locally). */
+    clearGateCache(): void;
+    /**
+     * Pace a throttled feature to one call per `throttleSpacingMs` (default 2s, the
+     * same delay the edge proxy applies). Each call reserves the next free slot, so
+     * concurrent calls queue in order. Returns false — without waiting — when the
+     * slot is more than `throttleMaxWaitMs` away (default 10s): a flood that deep is
+     * held back with a blocked response instead of stalling the host indefinitely.
+     * Only reached when the gate says "throttled", which only Throttle and Kill
+     * Switch modes ever do; Alert mode never slows a call.
+     */
+    paceThrottled(featureId: string): Promise<boolean>;
     enqueue(event: any): void;
     /**
      * Flush the queue. Coalesces concurrent callers onto ONE draining promise and
@@ -132,6 +169,30 @@ declare class AtlasBurnIngestor {
     private sendWithRetry;
 }
 export declare function getIngestor(options?: AtlasBurnSDKOptions): AtlasBurnIngestor | null;
+/** Request header that tags one AI call with a product feature. Stripped by the SDK
+ *  before the request reaches the provider. */
+export declare const ATLASBURN_FEATURE_HEADER = "x-atlasburn-feature";
+/**
+ * Tag a single AI call with the product feature it belongs to, so AtlasBurn can
+ * break cost down by feature. Pass as request headers on any fetch-based client:
+ *
+ *   client.messages.create(params, { headers: atlasburnFeature("support-chat") })   // Anthropic
+ *   client.chat.completions.create(params, { headers: atlasburnFeature("search") }) // OpenAI
+ *
+ * For one feature per process, set `metadata.featureId` in `initAtlasBurnAuto` instead.
+ */
+export declare function atlasburnFeature(featureId: string): Record<string, string>;
+/** Normalize a feature name: trimmed, max 100 chars, safe characters only. */
+export declare function sanitizeFeatureId(raw: unknown): string | undefined;
+/**
+ * Read and REMOVE the feature header from outgoing fetch args, so the provider never
+ * sees it. Handles a `Request` input and `init.headers` as Headers, [k, v][] or a
+ * record. Fails OPEN — any error returns the original args untouched.
+ */
+export declare function takeFeatureHeader(args: Parameters<typeof fetch>): {
+    args: Parameters<typeof fetch>;
+    featureId?: string;
+};
 export declare function initAtlasBurnAuto(options: AtlasBurnSDKOptions): void;
 export declare function verifyAtlasBurn(options: AtlasBurnSDKOptions): Promise<void>;
 export {};

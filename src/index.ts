@@ -1,6 +1,6 @@
 
 /**
- * AtlasBurn Forensic SDK - Institutional v1.5.0 (Universal Support)
+ * AtlasBurn Forensic SDK - v1.9.3 (Universal Support)
  * 
  * THE 4 LAWS OF SDK SAFETY:
  * 1. Never crash host app
@@ -19,6 +19,17 @@ export interface AtlasBurnSDKOptions {
   maxQueueSize?: number;
   metadata?: AtlasBurnMetadata;
   debug?: boolean;
+  /** How long one guardrail gate check may take before failing open. Default 2500ms. */
+  gateTimeoutMs?: number;
+  /** How long a gate decision is reused per feature before re-checking. Default 10000ms;
+   *  0 checks before every call. Stale decisions (up to 60s) are served while a
+   *  background refresh runs, so most AI calls never wait on the gate. */
+  gateCacheMs?: number;
+  /** While a feature is throttled, minimum gap between its AI calls. Default 2000ms. */
+  throttleSpacingMs?: number;
+  /** While throttled, the longest a call may wait for its slot; deeper queues get a
+   *  blocked response instead of stalling. Default 10000ms. */
+  throttleMaxWaitMs?: number;
   /** Operator hook for capture/gate anomalies — e.g. a provider usage-format change
    *  that would otherwise silently record $0, or a dropped flush/gate call. Fired
    *  out-of-band; wrapped so it never throws into the host (Law 1). Wire it to your
@@ -41,7 +52,7 @@ export interface AtlasBurnMetadata {
   sdkVersion?: string;
 }
 
-const SDK_VERSION = "1.9.2";
+const SDK_VERSION = "1.11.1";
 
 /**
  * I1 — hosts auto-detected by the fetch patch. `url.includes(p)` match, so these
@@ -101,6 +112,10 @@ export function buildBlockedResponse(url: string, gate: { message?: string; reas
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Retry-After': '60',
+    // Stop the provider SDK's automatic retries (OpenAI/Anthropic honor this). Without
+    // it they retry the 429 twice, honoring Retry-After, so a blocked call stalls the
+    // host for ~2 minutes before the error surfaces. A block should fail fast.
+    'x-should-retry': 'false',
     'x-atlasburn-blocked': '1',
     'x-atlasburn-reason': reason,
   };
@@ -222,6 +237,11 @@ function resolveGateUrl(options: AtlasBurnSDKOptions): string {
   return "https://app.atlasburn.com/api/gate";
 }
 
+type GateDecision = { blocked: boolean; status: string; message?: string; reason?: string; failed?: boolean };
+
+/** Decisions older than this are never served from cache; the call waits for a fresh check. */
+const GATE_MAX_STALE_MS = 60_000;
+
 class AtlasBurnIngestor {
   private queue: any[] = [];
   private options: AtlasBurnSDKOptions;
@@ -231,6 +251,9 @@ class AtlasBurnIngestor {
   private resolvedIngestUrl: string;
   private resolvedGateUrl: string;
   private flushInterval: any;
+  private gateCache = new Map<string, { decision: GateDecision; at: number }>();
+  private gateInflight = new Map<string, Promise<GateDecision>>();
+  private throttleNext = new Map<string, number>();
 
   constructor(options: AtlasBurnSDKOptions) {
     this.resolvedIngestUrl = resolveIngestUrl(options);
@@ -248,6 +271,10 @@ class AtlasBurnIngestor {
 
     if (typeof setInterval !== 'undefined') {
       this.flushInterval = setInterval(() => this.flush(), 5000);
+      // Never keep the host process alive just for telemetry: scripts, CLIs, cron jobs
+      // and serverless handlers must exit normally. Pending events still go out via the
+      // 'beforeExit' flush below. (Node returns a Timeout with unref; browsers a number.)
+      (this.flushInterval as any)?.unref?.();
     }
 
     if (typeof process !== 'undefined' && process.on) {
@@ -267,7 +294,7 @@ class AtlasBurnIngestor {
     }
   }
 
-  public async checkGate(featureId: string): Promise<{ blocked: boolean; status: string; message?: string; reason?: string }> {
+  public async checkGate(featureId: string): Promise<GateDecision> {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (this.options.apiKey) {
@@ -277,14 +304,80 @@ class AtlasBurnIngestor {
         method: 'POST',
         headers,
         body: JSON.stringify({ projectId: this.options.projectId || 'default', featureId }),
-        signal: AbortSignal.timeout(800)
+        signal: AbortSignal.timeout(this.options.gateTimeoutMs ?? 2500)
       });
-      if (!response.ok) return { blocked: false, status: 'active' };
+      if (!response.ok) return { blocked: false, status: 'active', failed: true };
       return await response.json();
     } catch (e) {
       this.diag({ stage: 'gate_error', url: this.resolvedGateUrl, error: e });
-      return { blocked: false, status: 'active' };
+      return { blocked: false, status: 'active', failed: true };
     }
+  }
+
+  /**
+   * Guardrail decision for a feature, without paying a gate round-trip on every AI
+   * call. Fresh (< gateCacheMs) → reuse. Stale (< 60s) → reuse and refresh in the
+   * background. Missing/too old → wait for a check. Concurrent callers share one
+   * in-flight check. A failed check never overwrites a known decision (so a known
+   * block isn't lifted by one network blip); with no known decision it fails open.
+   */
+  public async gateDecision(featureId: string): Promise<GateDecision> {
+    const ttl = Math.max(0, this.options.gateCacheMs ?? 10_000);
+    const hit = this.gateCache.get(featureId);
+    if (ttl > 0 && hit) {
+      const age = Date.now() - hit.at;
+      if (age < ttl) return hit.decision;
+      if (age < Math.max(ttl, GATE_MAX_STALE_MS)) {
+        void this.refreshGate(featureId);
+        return hit.decision;
+      }
+    }
+    return this.refreshGate(featureId);
+  }
+
+  private refreshGate(featureId: string): Promise<GateDecision> {
+    let inflight = this.gateInflight.get(featureId);
+    if (!inflight) {
+      inflight = this.checkGate(featureId)
+        .then((d) => {
+          if (!d.failed) {
+            this.gateCache.set(featureId, { decision: d, at: Date.now() });
+            return d;
+          }
+          const known = this.gateCache.get(featureId);
+          return known && Date.now() - known.at < GATE_MAX_STALE_MS ? known.decision : d;
+        })
+        .finally(() => { this.gateInflight.delete(featureId); });
+      this.gateInflight.set(featureId, inflight);
+    }
+    return inflight;
+  }
+
+  /** Forget cached gate decisions (tests, or after changing guardrails locally). */
+  public clearGateCache(): void {
+    this.gateCache.clear();
+    this.throttleNext.clear();
+  }
+
+  /**
+   * Pace a throttled feature to one call per `throttleSpacingMs` (default 2s, the
+   * same delay the edge proxy applies). Each call reserves the next free slot, so
+   * concurrent calls queue in order. Returns false — without waiting — when the
+   * slot is more than `throttleMaxWaitMs` away (default 10s): a flood that deep is
+   * held back with a blocked response instead of stalling the host indefinitely.
+   * Only reached when the gate says "throttled", which only Throttle and Kill
+   * Switch modes ever do; Alert mode never slows a call.
+   */
+  public async paceThrottled(featureId: string): Promise<boolean> {
+    const spacing = Math.max(0, this.options.throttleSpacingMs ?? 2000);
+    const maxWait = Math.max(0, this.options.throttleMaxWaitMs ?? 10_000);
+    const now = Date.now();
+    const slot = Math.max(now, this.throttleNext.get(featureId) ?? 0);
+    const wait = slot - now;
+    if (wait > maxWait) return false;
+    this.throttleNext.set(featureId, slot + spacing);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    return true;
   }
 
   public enqueue(event: any) {
@@ -408,6 +501,67 @@ async function ensureOpenAIStreamUsage(
   }
 }
 
+/** Request header that tags one AI call with a product feature. Stripped by the SDK
+ *  before the request reaches the provider. */
+export const ATLASBURN_FEATURE_HEADER = "x-atlasburn-feature";
+
+/**
+ * Tag a single AI call with the product feature it belongs to, so AtlasBurn can
+ * break cost down by feature. Pass as request headers on any fetch-based client:
+ *
+ *   client.messages.create(params, { headers: atlasburnFeature("support-chat") })   // Anthropic
+ *   client.chat.completions.create(params, { headers: atlasburnFeature("search") }) // OpenAI
+ *
+ * For one feature per process, set `metadata.featureId` in `initAtlasBurnAuto` instead.
+ */
+export function atlasburnFeature(featureId: string): Record<string, string> {
+  return { [ATLASBURN_FEATURE_HEADER]: featureId };
+}
+
+/** Normalize a feature name: trimmed, max 100 chars, safe characters only. */
+export function sanitizeFeatureId(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const cleaned = raw.trim().slice(0, 100).replace(/[^A-Za-z0-9._:/-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned || undefined;
+}
+
+/**
+ * Read and REMOVE the feature header from outgoing fetch args, so the provider never
+ * sees it. Handles a `Request` input and `init.headers` as Headers, [k, v][] or a
+ * record. Fails OPEN — any error returns the original args untouched.
+ */
+export function takeFeatureHeader(args: Parameters<typeof fetch>): { args: Parameters<typeof fetch>; featureId?: string } {
+  try {
+    const [input, init] = args;
+    const isRequest = typeof Request !== 'undefined' && input instanceof Request;
+    let featureId: string | undefined;
+
+    let initHeaders = init?.headers;
+    if (initHeaders) {
+      const h = new Headers(initHeaders as HeadersInit);
+      if (h.has(ATLASBURN_FEATURE_HEADER)) {
+        featureId = sanitizeFeatureId(h.get(ATLASBURN_FEATURE_HEADER));
+        h.delete(ATLASBURN_FEATURE_HEADER);
+        initHeaders = h;
+      }
+    }
+
+    let newInput = input;
+    if (isRequest && (input as Request).headers.has(ATLASBURN_FEATURE_HEADER)) {
+      featureId = featureId ?? sanitizeFeatureId((input as Request).headers.get(ATLASBURN_FEATURE_HEADER));
+      const h = new Headers((input as Request).headers);
+      h.delete(ATLASBURN_FEATURE_HEADER);
+      newInput = new Request(input as Request, { headers: h });
+    }
+
+    if (newInput === input && initHeaders === init?.headers) return { args, featureId };
+    const newInit = init ? { ...init, headers: initHeaders } : undefined;
+    return { args: (newInit ? [newInput, newInit] : [newInput]) as Parameters<typeof fetch>, featureId };
+  } catch {
+    return { args };
+  }
+}
+
 export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
   const ingestor = getIngestor(options);
   if (!ingestor || typeof globalThis === 'undefined' || !globalThis.fetch) return;
@@ -415,23 +569,39 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
   _atlasBurnPatched = true;
 
   let currentFetch = globalThis.fetch;
-  const wrappedFetch = async (...args: Parameters<typeof fetch>): Promise<Response> => {
-    const input = args[0];
+  // App-wide default feature (metadata.featureId); a per-call x-atlasburn-feature
+  // header overrides it. Neither set → the legacy "auto-detect" labels.
+  const defaultFeatureId = sanitizeFeatureId(options.metadata?.featureId);
+  const wrappedFetch = async (...callArgs: Parameters<typeof fetch>): Promise<Response> => {
+    const input = callArgs[0];
     const url = (input instanceof Request ? input.url : input?.toString()) || "";
     const isAIUrl = AI_PATTERNS.some(p => url.includes(p));
 
-    if (!isAIUrl) return currentFetch(...args);
+    if (!isAIUrl) return currentFetch(...callArgs);
+
+    // Feature tag: read + strip the header so the provider never sees it.
+    const tagged = takeFeatureHeader(callArgs);
+    const args = tagged.args;
+    const featureId = tagged.featureId || defaultFeatureId;
 
     // Gate check. The ingestor's own HTTP uses ORIGINAL_FETCH, so checkGate never
     // re-enters this wrapper — no recursion flag is needed, and concurrent AI calls
     // are each gated + captured independently (fixes the shared-flag skip, SEC-002 #1).
     if (isAIUrl) {
       try {
-        const gate = await ingestor.checkGate("auto-detect");
+        const gate = await ingestor.gateDecision(featureId || "auto-detect");
         if (gate.blocked) {
           // Provider-native 429 (SEC-002 #2) — not a one-shape 200 that breaks
           // non-OpenAI parsers and lets agent loops treat a block as a real answer.
           return buildBlockedResponse(url, gate);
+        }
+        // Throttled (Throttle / Kill Switch modes only): slow this feature down
+        // instead of cutting it. A queue too deep to wait out is held back.
+        if (gate.status === "throttled" && !(await ingestor.paceThrottled(featureId || "auto-detect"))) {
+          return buildBlockedResponse(url, {
+            message: "Request held back by AtlasBurn throttling: this feature is calling faster than its throttle allows. It speeds back up on its own, or resume it in the AtlasBurn dashboard.",
+            reason: "guardrail_throttled",
+          });
         }
       } catch (e) {
         // Gate check failed — fail open (proceed with the call), per Law 2.
@@ -472,7 +642,7 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
         if (p > 0 || c > 0) {
           ingestor.enqueue({
             model: data.model || data.modelVersion || "detected-model",
-            featureId: "auto-detect",
+            featureId: featureId || "auto-detect",
             latency,
             usage: { prompt_tokens: p, completion_tokens: c }
           });
@@ -526,7 +696,7 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
             if (finalTokens.prompt > 0 || finalTokens.completion > 0) {
               ingestor.enqueue({
                 model: finalModel,
-                featureId: "auto-detect-stream",
+                featureId: featureId || "auto-detect-stream",
                 latency,
                 usage: { prompt_tokens: finalTokens.prompt, completion_tokens: finalTokens.completion }
               });
@@ -536,7 +706,7 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
               // flag the record estimated:true so it's disclosed, never billed as exact.
               ingestor.enqueue({
                 model: finalModel,
-                featureId: "auto-detect-stream",
+                featureId: featureId || "auto-detect-stream",
                 latency,
                 estimated: true,
                 usage: {
