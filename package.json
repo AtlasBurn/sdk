@@ -1,6 +1,6 @@
 {
   "name": "@atlasburn/sdk",
-  "version": "1.11.1",
+  "version": "1.11.2",
   "description": "Real-time AI cost monitoring and control SDK. Auto-captures token usage and spend from OpenAI, Anthropic, Gemini, and 10 more LLM providers, with runtime guardrails to stop runaway AI agents before they overspend.",
   "type": "module",
   "main": "./dist/index.js",

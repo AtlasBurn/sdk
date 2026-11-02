@@ -52,7 +52,7 @@ export interface AtlasBurnMetadata {
   sdkVersion?: string;
 }
 
-const SDK_VERSION = "1.11.1";
+const SDK_VERSION = "1.11.2";
 
 /**
  * I1 — hosts auto-detected by the fetch patch. `url.includes(p)` match, so these
@@ -61,12 +61,12 @@ const SDK_VERSION = "1.11.1";
  * Kept in sync with the proxy's PROVIDER_MAP — see docs/integration-matrix.md.
  * NOTE: Azure/Vertex/Bedrock are SDK-detectable here but can NOT be transparently
  * proxied (deployment-scoped URLs / OAuth+project paths / SigV4 signing).
+ * Vertex AI is NOT in this list: it is matched by host AND path in isVertexModelCall().
  */
 export const AI_PATTERNS: string[] = [
   "api.openai.com",
   "api.anthropic.com",
   "generativelanguage.googleapis.com",
-  "vertexai.googleapis.com",
   // I1 additions:
   "openai.azure.com",       // Azure OpenAI (deployment-scoped; SDK-only)
   "openrouter.ai",
@@ -78,6 +78,33 @@ export const AI_PATTERNS: string[] = [
   "api.x.ai",
   "bedrock-runtime",        // AWS Bedrock (token counts via response headers; best-effort)
 ];
+
+/**
+ * Vertex AI. Its hosts are `{location}-aiplatform.googleapis.com` (regional),
+ * `aiplatform.googleapis.com` (global / express mode) and
+ * `aiplatform.{us|eu}.rep.googleapis.com` (multi-region). There is no
+ * `vertexai.googleapis.com` — the pattern used before 1.11.2 never matched real traffic.
+ * The same hosts also serve non-model APIs (jobs, endpoints, operations), so only
+ * model-call paths count: `:generateContent` / `:streamGenerateContent` (Gemini),
+ * `:rawPredict` / `:streamRawPredict` (partner models, e.g. Claude on Vertex) and the
+ * OpenAI-compatible `/chat/completions` endpoint. `:countTokens` is free and excluded.
+ */
+const VERTEX_HOST = /(^|[.-])aiplatform(\.(us|eu)\.rep)?\.googleapis\.com$/i;
+const VERTEX_MODEL_CALL = /:(streamGenerateContent|generateContent|streamRawPredict|rawPredict)$|\/chat\/completions$/;
+
+export function isVertexModelCall(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return VERTEX_HOST.test(u.hostname) && VERTEX_MODEL_CALL.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Is this request an AI model call the SDK should gate and meter? Exported for tests. */
+export function isAIRequestUrl(url: string): boolean {
+  return AI_PATTERNS.some((p) => url.includes(p)) || isVertexModelCall(url);
+}
 
 /**
  * The real fetch, captured at module load — BEFORE initAtlasBurnAuto patches
@@ -124,7 +151,7 @@ export function buildBlockedResponse(url: string, gate: { message?: string; reas
   let body: unknown;
   if (url.includes('api.anthropic.com')) {
     body = { type: 'error', error: { type: 'rate_limit_error', message }, _atlasburn: marker };
-  } else if (url.includes('generativelanguage.googleapis.com') || url.includes('vertexai')) {
+  } else if (url.includes('generativelanguage.googleapis.com') || isVertexModelCall(url)) {
     body = { error: { code: 429, message, status: 'RESOURCE_EXHAUSTED' }, _atlasburn: marker };
   } else if (url.includes('cohere')) {
     body = { message, _atlasburn: marker };
@@ -575,7 +602,7 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
   const wrappedFetch = async (...callArgs: Parameters<typeof fetch>): Promise<Response> => {
     const input = callArgs[0];
     const url = (input instanceof Request ? input.url : input?.toString()) || "";
-    const isAIUrl = AI_PATTERNS.some(p => url.includes(p));
+    const isAIUrl = isAIRequestUrl(url);
 
     if (!isAIUrl) return currentFetch(...callArgs);
 
@@ -632,7 +659,12 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
 
     if (contentType.includes("application/json")) {
       try {
-        const data = await response.clone().json();
+        const raw = await response.clone().json();
+        // Vertex AI's non-SSE :streamGenerateContent returns a JSON ARRAY of chunks;
+        // the token counts ride on the last chunk that carries usage.
+        const data = Array.isArray(raw)
+          ? [...raw].reverse().find((x) => x && (x.usageMetadata || x.usage)) ?? raw[raw.length - 1] ?? {}
+          : raw;
         let { prompt: p, completion: c } = extractTokenUsage(data);
         // Bedrock reports token counts in response HEADERS, not the body.
         if (p === 0 && c === 0) {

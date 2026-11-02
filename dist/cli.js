@@ -180,7 +180,8 @@ async function claimKey(code) {
 const PROVIDER_MAP = [
     { pkgs: ["openai"], name: "OpenAI" },
     { pkgs: ["@anthropic-ai/sdk"], name: "Anthropic" },
-    { pkgs: ["@google/generative-ai", "@google-cloud/vertexai", "@google-ai/generativelanguage"], name: "Google (Gemini/Vertex)" },
+    { pkgs: ["@google/genai", "@google/generative-ai", "@google-cloud/vertexai", "@google-ai/generativelanguage"], name: "Google (Gemini/Vertex)" },
+    { pkgs: ["@anthropic-ai/vertex-sdk"], name: "Claude on Vertex" },
     { pkgs: ["@azure/openai"], name: "Azure OpenAI" },
     { pkgs: ["cohere-ai"], name: "Cohere" },
     { pkgs: ["@mistralai/mistralai"], name: "Mistral" },

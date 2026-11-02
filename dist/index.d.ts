@@ -54,8 +54,12 @@ export interface AtlasBurnMetadata {
  * Kept in sync with the proxy's PROVIDER_MAP — see docs/integration-matrix.md.
  * NOTE: Azure/Vertex/Bedrock are SDK-detectable here but can NOT be transparently
  * proxied (deployment-scoped URLs / OAuth+project paths / SigV4 signing).
+ * Vertex AI is NOT in this list: it is matched by host AND path in isVertexModelCall().
  */
 export declare const AI_PATTERNS: string[];
+export declare function isVertexModelCall(url: string): boolean;
+/** Is this request an AI model call the SDK should gate and meter? Exported for tests. */
+export declare function isAIRequestUrl(url: string): boolean;
 /**
  * Response returned when the gate reports the guardrail is suspended (gate.blocked).
  *
