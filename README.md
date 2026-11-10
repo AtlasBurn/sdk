@@ -78,7 +78,7 @@ Detected automatically: **OpenAI, Anthropic, Google Gemini, Vertex AI, Azure Ope
 response headers), **Mistral, Cohere, Groq, DeepSeek, xAI, Together AI and OpenRouter**.
 
 Not on Node.js? Python, Go, Ruby and anything else that makes HTTP calls can route OpenAI, Anthropic, Gemini or
-OpenRouter traffic through the [AtlasBurn proxy](https://docs.atlasburn.com) instead. Run `npx abn init --proxy` to
+OpenRouter traffic through the [AtlasBurn proxy](https://docs.atlasburn.com/docs/proxy-quickstart/) instead. Run `npx abn init --proxy` to
 print the base URLs.
 
 ## Guardrails
@@ -131,6 +131,17 @@ initAtlasBurnAuto({
 - Website: [atlasburn.com](https://atlasburn.com)
 - Dashboard: [app.atlasburn.com](https://app.atlasburn.com)
 - Docs: [docs.atlasburn.com](https://docs.atlasburn.com)
+  - [Quickstart](https://docs.atlasburn.com/docs/quickstart/) · [SDK reference](https://docs.atlasburn.com/docs/sdk/) ·
+    [Guardrails and the kill switch](https://docs.atlasburn.com/docs/guardrails/) ·
+    [Edge Proxy for Python, Go and any language](https://docs.atlasburn.com/docs/proxy-quickstart/) ·
+    [Supported providers](https://docs.atlasburn.com/docs/integrations/) ·
+    [MCP server for Claude and ChatGPT](https://docs.atlasburn.com/docs/mcp-server/) ·
+    [Changelog](https://docs.atlasburn.com/docs/changelog/)
+- How AtlasBurn compares: [vs Helicone](https://atlasburn.com/blog/atlasburn-vs-helicone/) ·
+  [vs Langfuse](https://atlasburn.com/blog/atlasburn-vs-langfuse/) · [vs LiteLLM](https://atlasburn.com/blog/atlasburn-vs-litellm/) ·
+  [vs Portkey](https://atlasburn.com/blog/atlasburn-vs-portkey/)
+- Blog: [The Ledger](https://atlasburn.com/blog/) — AI spend, runaway agents and guardrails
+- For AI assistants: [llms.txt](https://atlasburn.com/llms.txt) · [docs llms.txt](https://docs.atlasburn.com/llms.txt)
 - MCP server: [github.com/AtlasBurn/atlasburn-mcp](https://github.com/AtlasBurn/atlasburn-mcp)
 
 ## License
