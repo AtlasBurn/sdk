@@ -140,6 +140,7 @@ initAtlasBurnAuto({
 - How AtlasBurn compares: [vs Helicone](https://atlasburn.com/blog/atlasburn-vs-helicone/) ·
   [vs Langfuse](https://atlasburn.com/blog/atlasburn-vs-langfuse/) · [vs LiteLLM](https://atlasburn.com/blog/atlasburn-vs-litellm/) ·
   [vs Portkey](https://atlasburn.com/blog/atlasburn-vs-portkey/)
+- Guide: [How to stop a runaway AI agent loop before it runs up your OpenAI or Anthropic bill](https://dev.to/akhil_5d07/how-to-stop-a-runaway-ai-agent-loop-before-it-runs-up-your-openai-or-anthropic-bill-58oi) (DEV): a copyable per-feature circuit breaker and how the tools compare
 - Blog: [The Ledger](https://atlasburn.com/blog/) — AI spend, runaway agents and guardrails
 - For AI assistants: [llms.txt](https://atlasburn.com/llms.txt) · [docs llms.txt](https://docs.atlasburn.com/llms.txt)
 - MCP server: [github.com/AtlasBurn/atlasburn-mcp](https://github.com/AtlasBurn/atlasburn-mcp)
