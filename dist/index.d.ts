@@ -109,11 +109,33 @@ export declare function injectStreamUsage(bodyText: string): {
  *  - Gemini: usageMetadata.promptTokenCount / candidatesTokenCount
  *  - Cohere: nested under usage|meta . billed_units|tokens . input_tokens/output_tokens
  * (Bedrock reports counts in HTTP headers, handled separately at the response.)
+ *
+ * Anthropic prompt caching: `input_tokens` counts ONLY the uncached part. Cached
+ * context arrives separately as `cache_read_input_tokens` (billed ~0.1x) and
+ * `cache_creation_input_tokens` (billed 1.25x, or 2x for 1-hour writes). `prompt`
+ * is therefore the TOTAL input (uncached + cache read + cache write) so loop
+ * detection sees the real context size; the cache parts are returned separately
+ * (only when non-zero) so the server can price them at their own rates.
+ * OpenAI and Gemini already include cached tokens in prompt_tokens/promptTokenCount.
+ * Anthropic streams put usage on `message_start` under `message.usage`.
  */
-export declare function extractTokenUsage(obj: any): {
+export interface TokenUsage {
     prompt: number;
     completion: number;
-};
+    cacheRead?: number;
+    cacheWrite?: number;
+    cacheWrite1h?: number;
+}
+export declare function extractTokenUsage(obj: any): TokenUsage;
+/**
+ * Merge token usage seen across stream events. Anthropic reports input (and cache)
+ * counts on `message_start` and the cumulative output on `message_delta`, so a later
+ * event must never wipe an earlier non-zero field: keep the largest value per field.
+ * (OpenAI sends one final usage chunk; Gemini repeats cumulative usageMetadata.)
+ */
+export declare function mergeTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage;
+/** Wire format for the ingest route: the cache fields are sent only when present. */
+export declare function usagePayload(t: TokenUsage): Record<string, number>;
 type GateDecision = {
     blocked: boolean;
     status: string;

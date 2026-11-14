@@ -43,6 +43,25 @@ const ok = (s) => `${C.green("✓")} ${s}`;
 const bad = (s) => `${C.red("✗")} ${s}`;
 const warn = (s) => `${C.yellow("⚠")}  ${s}`;
 const info = (s) => `${C.cyan("›")} ${s}`;
+const protocolError = (p) => [
+    `${C.red("✗")} ${C.bold(p.heading)} ${C.gray(`[${p.code}]`)}`,
+    `  ${p.explanation}`,
+    ...(p.recovery ? [`  ${C.dim("→")} ${p.recovery}`] : []),
+    ...(p.status ? [`  ${C.gray(p.status)}`] : []),
+].join("\n");
+const ERR = {
+    SDK_KEY_MALFORMED: { heading: "KEY FORMAT NOT RECOGNISED", code: "SDK_KEY_MALFORMED", explanation: `AtlasBurn ingest keys start with ${KEY_PREFIX}.`, recovery: "Copy the key from Settings → API keys and run abn init again." },
+    SDK_KEY_REJECTED: { heading: "KEY REJECTED", code: "SDK_KEY_REJECTED", explanation: "AtlasBurn didn't accept this key. It may be revoked or mistyped.", recovery: "Generate a new key in Settings → API keys and run abn init again." },
+    SDK_RUNTIME_UNSUPPORTED: { heading: "RUNTIME NOT SUPPORTED", code: "SDK_RUNTIME_UNSUPPORTED", explanation: `The SDK needs Node ${MIN_NODE} or newer (it relies on the built-in fetch).`, recovery: "Upgrade Node, or capture calls with the Edge Proxy instead." },
+    MCP_SETUP_CODE_INVALID: { heading: "SETUP CODE REJECTED", code: "MCP_SETUP_CODE_INVALID", explanation: "This setup code isn't valid or was already used.", recovery: "Ask your AI assistant for a new setup code.", status: "STATUS: ABORTED · KEY: NOT ISSUED" },
+    NETWORK_UNREACHABLE: { heading: "CONNECTION FAILED", code: "NETWORK_UNREACHABLE", explanation: "AtlasBurn couldn't be reached.", recovery: "Check your connection and try again." },
+    SERVER_UNEXPECTED: { heading: "SERVICE ERROR", code: "SERVER_UNEXPECTED", explanation: "Something went wrong on our side.", recovery: "Try again. If it keeps happening, contact contact@atlasburn.com." },
+};
+/** A failed key check → KEY REJECTED (401), SERVICE ERROR (5xx) or CONNECTION FAILED. */
+const keyCheckError = (code, extra) => protocolError({
+    ...(code === 401 ? ERR.SDK_KEY_REJECTED : typeof code === "number" && code >= 500 ? ERR.SERVER_UNEXPECTED : ERR.NETWORK_UNREACHABLE),
+    ...extra,
+});
 // ── flags ────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -425,7 +444,9 @@ function doctorReport(project) {
     const major = parseInt(process.versions.node.split(".")[0] || "0", 10);
     const fetchOk = typeof globalThis.fetch === "function";
     console.log(C.bold("\nabn doctor\n"));
-    console.log(major >= MIN_NODE ? ok(`Node ${process.versions.node} (≥ ${MIN_NODE})`) : bad(`Node ${process.versions.node} — need ≥ ${MIN_NODE} to patch fetch`));
+    console.log(major >= MIN_NODE
+        ? ok(`Node ${process.versions.node} (≥ ${MIN_NODE})`)
+        : protocolError({ ...ERR.SDK_RUNTIME_UNSUPPORTED, explanation: `Node ${process.versions.node} is too old. ${ERR.SDK_RUNTIME_UNSUPPORTED.explanation}` }));
     console.log(fetchOk ? ok("global fetch available") : bad("global fetch missing — upgrade Node or add a fetch polyfill"));
     console.log(info(`runtime: ${typeof globalThis.EdgeRuntime !== "undefined" ? "edge" : "node"}`));
     if (project) {
@@ -473,7 +494,7 @@ async function cmdTest(explicitKey) {
         catch { /* fire-and-forget; never fail the test on the pulse */ }
     }
     else {
-        console.log(bad(res.code === 401 ? "invalid or revoked key" : `could not reach AtlasBurn (${res.error || res.code})`));
+        console.log(keyCheckError(res.code, res.code === 401 ? { recovery: "Generate a new key in Settings → API keys, then run abn init again." } : undefined));
         process.exitCode = 1;
     }
 }
@@ -487,7 +508,7 @@ async function cmdStatus() {
     }
     const res = await gateCheck(key);
     if (!res.ok) {
-        console.log(bad(res.code === 401 ? "invalid or revoked key" : `unreachable (${res.error || res.code})`));
+        console.log(keyCheckError(res.code));
         process.exitCode = 1;
         return;
     }
@@ -567,7 +588,12 @@ async function cmdInit() {
             console.log(ok("new key created"));
         }
         catch (e) {
-            console.log(bad(e?.message || "couldn't redeem the setup code"));
+            // The claim endpoint answers with "That setup code isn't valid / has expired…";
+            // anything else (no response) is a connection problem, not a bad code.
+            const msg = String(e?.message || "");
+            console.log("\n" + (/setup code/i.test(msg)
+                ? protocolError({ ...ERR.MCP_SETUP_CODE_INVALID, ...(/expired/i.test(msg) ? { explanation: "This setup code has expired." } : {}) })
+                : protocolError({ ...ERR.NETWORK_UNREACHABLE, explanation: "AtlasBurn couldn't be reached to redeem the setup code." })));
             process.exitCode = 1;
             return;
         }
@@ -584,7 +610,7 @@ async function cmdInit() {
                 continue;
             }
             if (!validPrefix(key)) {
-                console.log(bad(`Key should start with "${KEY_PREFIX}". Get one from ${DASH_URL}.`));
+                console.log(protocolError({ ...ERR.SDK_KEY_MALFORMED, recovery: `Copy the key from Settings → API keys (${DASH_URL}) and paste it again.` }));
                 key = "";
                 continue;
             }
@@ -601,7 +627,7 @@ async function cmdInit() {
     process.stdout.write(info("Verifying key… "));
     const check = await gateCheck(key);
     if (!check.ok && check.code === 401) {
-        console.log(bad("this key is invalid or revoked. Aborting — nothing written."));
+        console.log("\n" + protocolError({ ...ERR.SDK_KEY_REJECTED, status: "STATUS: ABORTED · FILES: UNCHANGED" }));
         process.exitCode = 1;
         return;
     }

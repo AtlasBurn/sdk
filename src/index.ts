@@ -52,7 +52,7 @@ export interface AtlasBurnMetadata {
   sdkVersion?: string;
 }
 
-const SDK_VERSION = "1.11.2";
+const SDK_VERSION = "1.11.3";
 
 /**
  * I1 — hosts auto-detected by the fetch patch. `url.includes(p)` match, so these
@@ -228,16 +228,67 @@ export function injectStreamUsage(bodyText: string): { body: string; promptText:
  *  - Gemini: usageMetadata.promptTokenCount / candidatesTokenCount
  *  - Cohere: nested under usage|meta . billed_units|tokens . input_tokens/output_tokens
  * (Bedrock reports counts in HTTP headers, handled separately at the response.)
+ *
+ * Anthropic prompt caching: `input_tokens` counts ONLY the uncached part. Cached
+ * context arrives separately as `cache_read_input_tokens` (billed ~0.1x) and
+ * `cache_creation_input_tokens` (billed 1.25x, or 2x for 1-hour writes). `prompt`
+ * is therefore the TOTAL input (uncached + cache read + cache write) so loop
+ * detection sees the real context size; the cache parts are returned separately
+ * (only when non-zero) so the server can price them at their own rates.
+ * OpenAI and Gemini already include cached tokens in prompt_tokens/promptTokenCount.
+ * Anthropic streams put usage on `message_start` under `message.usage`.
  */
-export function extractTokenUsage(obj: any): { prompt: number; completion: number } {
+export interface TokenUsage {
+  prompt: number;
+  completion: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cacheWrite1h?: number;
+}
+
+export function extractTokenUsage(obj: any): TokenUsage {
   if (!obj || typeof obj !== 'object') return { prompt: 0, completion: 0 };
-  const u = obj.usage || obj.usageMetadata || {};
+  const u = obj.usage || obj.message?.usage || obj.usageMetadata || {};
   const nested = u.billed_units || u.tokens || obj.meta?.billed_units || obj.meta?.tokens || {};
-  const num = (v: any) => (typeof v === 'number' && isFinite(v) ? v : 0);
-  return {
-    prompt: num(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? nested.input_tokens),
+  const num = (v: any) => (typeof v === 'number' && isFinite(v) && v > 0 ? v : 0);
+  const cacheRead = num(u.cache_read_input_tokens);
+  const cacheWrite = num(u.cache_creation_input_tokens);
+  const cacheWrite1h = Math.min(cacheWrite, num(u.cache_creation?.ephemeral_1h_input_tokens));
+  const out: TokenUsage = {
+    prompt: num(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? nested.input_tokens) + cacheRead + cacheWrite,
     completion: num(u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? nested.output_tokens),
   };
+  if (cacheRead) out.cacheRead = cacheRead;
+  if (cacheWrite) out.cacheWrite = cacheWrite;
+  if (cacheWrite1h) out.cacheWrite1h = cacheWrite1h;
+  return out;
+}
+
+/**
+ * Merge token usage seen across stream events. Anthropic reports input (and cache)
+ * counts on `message_start` and the cumulative output on `message_delta`, so a later
+ * event must never wipe an earlier non-zero field: keep the largest value per field.
+ * (OpenAI sends one final usage chunk; Gemini repeats cumulative usageMetadata.)
+ */
+export function mergeTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  const out: TokenUsage = {
+    prompt: Math.max(a.prompt, b.prompt),
+    completion: Math.max(a.completion, b.completion),
+  };
+  for (const k of ['cacheRead', 'cacheWrite', 'cacheWrite1h'] as const) {
+    const v = Math.max(a[k] || 0, b[k] || 0);
+    if (v) out[k] = v;
+  }
+  return out;
+}
+
+/** Wire format for the ingest route: the cache fields are sent only when present. */
+export function usagePayload(t: TokenUsage): Record<string, number> {
+  const p: Record<string, number> = { prompt_tokens: t.prompt, completion_tokens: t.completion };
+  if (t.cacheRead) p.cache_read_input_tokens = t.cacheRead;
+  if (t.cacheWrite) p.cache_creation_input_tokens = t.cacheWrite;
+  if (t.cacheWrite1h) p.cache_creation_1h_input_tokens = t.cacheWrite1h;
+  return p;
 }
 
 function generateForensicId(): string {
@@ -665,18 +716,20 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
         const data = Array.isArray(raw)
           ? [...raw].reverse().find((x) => x && (x.usageMetadata || x.usage)) ?? raw[raw.length - 1] ?? {}
           : raw;
-        let { prompt: p, completion: c } = extractTokenUsage(data);
+        let tokens = extractTokenUsage(data);
         // Bedrock reports token counts in response HEADERS, not the body.
-        if (p === 0 && c === 0) {
-          p = Number(response.headers.get("x-amzn-bedrock-input-token-count")) || 0;
-          c = Number(response.headers.get("x-amzn-bedrock-output-token-count")) || 0;
+        if (tokens.prompt === 0 && tokens.completion === 0) {
+          tokens = {
+            prompt: Number(response.headers.get("x-amzn-bedrock-input-token-count")) || 0,
+            completion: Number(response.headers.get("x-amzn-bedrock-output-token-count")) || 0,
+          };
         }
-        if (p > 0 || c > 0) {
+        if (tokens.prompt > 0 || tokens.completion > 0) {
           ingestor.enqueue({
             model: data.model || data.modelVersion || "detected-model",
             featureId: featureId || "auto-detect",
             latency,
-            usage: { prompt_tokens: p, completion_tokens: c }
+            usage: usagePayload(tokens)
           });
         } else {
           // 200 JSON from an AI endpoint but no usage extracted — the classic signal
@@ -690,7 +743,8 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
         (async () => {
           try {
             const decoder = new TextDecoder();
-            let buffer = "", finalModel = "streaming-model", finalTokens = { prompt: 0, completion: 0 };
+            let buffer = "", finalModel = "streaming-model";
+            let finalTokens: TokenUsage = { prompt: 0, completion: 0 };
             let completionText = "";
             while (true) {
               const { done, value } = await reader.read();
@@ -705,12 +759,9 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
                 try {
                   const json = JSON.parse(dataStr);
                   if (json.model) finalModel = json.model;
+                  if (json.message?.model) finalModel = json.message.model; // Anthropic message_start
                   if (json.modelVersion) finalModel = json.modelVersion;
-                  const u = extractTokenUsage(json);
-                  if (u.prompt > 0 || u.completion > 0) {
-                    finalTokens.prompt = u.prompt;
-                    finalTokens.completion = u.completion;
-                  }
+                  finalTokens = mergeTokenUsage(finalTokens, extractTokenUsage(json));
                   // Accumulate streamed content for the estimate fallback (chat delta,
                   // legacy text completion, or Gemini parts) — but ONLY when we did
                   // NOT inject include_usage. When injected, OpenAI sends a final
@@ -730,7 +781,7 @@ export function initAtlasBurnAuto(options: AtlasBurnSDKOptions) {
                 model: finalModel,
                 featureId: featureId || "auto-detect-stream",
                 latency,
-                usage: { prompt_tokens: finalTokens.prompt, completion_tokens: finalTokens.completion }
+                usage: usagePayload(finalTokens)
               });
             } else if (completionText.length > 0 || promptText.length > 0) {
               // I3 fallback — the provider streamed no usage (injection couldn't be
