@@ -52,7 +52,7 @@ export interface AtlasBurnMetadata {
   sdkVersion?: string;
 }
 
-const SDK_VERSION = "1.11.3";
+const SDK_VERSION = "1.11.4";
 
 /**
  * I1 — hosts auto-detected by the fetch patch. `url.includes(p)` match, so these
@@ -517,9 +517,15 @@ class AtlasBurnIngestor {
           events: events
         }),
       });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) {
+        // 4xx (bad key, bad payload) won't succeed on retry — except timeouts/rate limits.
+        const s = response.status;
+        const e: any = new Error(`HTTP ${s}`);
+        e.permanent = s >= 400 && s < 500 && s !== 408 && s !== 429;
+        throw e;
+      }
     } catch (err) {
-      if (attempt < this.maxRetries) {
+      if (!(err as any)?.permanent && attempt < this.maxRetries) {
         await new Promise(r => setTimeout(r, Math.pow(2, attempt) * 1000));
         return this.sendWithRetry(events, attempt + 1);
       }
